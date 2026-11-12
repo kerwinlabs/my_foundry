@@ -16,7 +16,7 @@ contract CounterScript is BaseScript {
         // 保存了合约地址到本地
         saveContract("Counter", address(counter));
 
-        counter.setNumber(10);
+        counter.setNumber(20);
         counter.increment();
     }
 }
