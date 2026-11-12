@@ -201,7 +201,7 @@ contract NFTMarket is ITokensReceiver, IERC721Receiver {
         address from,
         uint256 tokenId,
         bytes calldata /* data */
-    ) external override returns (bytes4) {
+    ) external view override returns (bytes4) {
         if (msg.sender != address(nft)) revert NotNFT();
         if (operator != address(this) || listings[tokenId].seller != from) {
             revert UnsolicitedNFT();
