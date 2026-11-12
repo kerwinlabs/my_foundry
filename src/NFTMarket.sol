@@ -4,6 +4,28 @@ pragma solidity ^0.8.24;
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {CalledToken, ITokensReceiver} from "./CalledToken.sol";
 
+// ===========================================================================
+// 支付方案对比（纯 ERC20 版本保留为注释，方便对照）
+// ---------------------------------------------------------------------------
+// 方案 A（当前启用）：CalledToken
+//   CalledToken 本身是标准 ERC20，所以 approve + buyNFT 依然可用；
+//   在此基础上额外支持 transferAndCall：
+//   买家调用 Token.transferAndCall(market, price, abi.encode(tokenId))，
+//   Token 先把钱转到市场，再回调 market.onTokensReceived 完成购买，无需 approve。
+//
+// 方案 B（纯 ERC20，已注释）：
+//   只有 approve + buyNFT 一条路径：
+//   买家先 Token.approve(market, price)，再调用 market.buyNFT(tokenId, price)，
+//   由市场用 transferFrom 把钱从买家直接转给卖家。
+//   如果换成 USDT 这类返回值不规范的代币，需要使用 SafeERC20。
+//
+// 两种方案的共同点：NFT 都在 list() 时托管到市场合约。
+// ===========================================================================
+
+// 方案 B 需要的 import：
+// import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+// import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
 /// @title NFTMarket
 /// @notice 使用 CalledToken 作为支付代币买卖 MyERC721 的简单市场。
 ///
@@ -12,14 +34,18 @@ import {CalledToken, ITokensReceiver} from "./CalledToken.sol";
 ///         2. 调用 list(tokenId, price) 上架，NFT 会转入本合约托管。
 ///
 ///         购买流程（二选一）：
-///         A. approve + buyNFT：
+///         1. approve + buyNFT（纯 ERC20 也同样支持）：
 ///            买家先调用 Token.approve(address(market), price)，再调用 buyNFT(tokenId, amount)；
-///         B. transferAndCall 直接购买：
+///         2. transferAndCall 直接购买（CalledToken 专属）：
 ///            买家调用 Token.transferAndCall(address(market), price, abi.encode(tokenId))，
 ///            Token 合约会在转账后回调本合约的 onTokensReceived 完成购买，无需 approve。
 ///
 ///         卖家也可以调用 delist(tokenId) 下架并取回 NFT。
 contract NFTMarket is ITokensReceiver {
+    // 方案 B（纯 ERC20）的声明：
+    // using SafeERC20 for IERC20;
+    // IERC20 public immutable token;
+
     /// @notice 支付代币（CalledToken）。
     CalledToken public immutable token;
 
@@ -63,6 +89,15 @@ contract NFTMarket is ITokensReceiver {
         nft = _nft;
     }
 
+    // 方案 B（纯 ERC20）的构造函数：
+    // constructor(IERC20 _token, IERC721 _nft) {
+    //     if (address(_token) == address(0) || address(_nft) == address(0)) {
+    //         revert ZeroAddress();
+    //     }
+    //     token = _token;
+    //     nft = _nft;
+    // }
+
     /// @dev 只允许绑定的 CalledToken 合约调用回调，避免伪造购买。
     modifier onlyToken() {
         if (msg.sender != address(token)) revert NotToken();
@@ -101,7 +136,10 @@ contract NFTMarket is ITokensReceiver {
         delete listings[tokenId];
 
         // TOKEN 由买家直接转给卖家，本合约不托管 ERC20。
+        // 方案 A（CalledToken）：CalledToken 本身就是标准 ERC20，直接 transferFrom 即可。
         token.transferFrom(msg.sender, listing.seller, amount);
+        // 方案 B（纯 ERC20）：如果换成 USDT 这类非标准代币，改用 SafeERC20：
+        // token.safeTransferFrom(msg.sender, listing.seller, amount);
 
         // 把托管的 NFT 转给买家。
         nft.safeTransferFrom(address(this), msg.sender, tokenId);
@@ -110,6 +148,8 @@ contract NFTMarket is ITokensReceiver {
     }
 
     /// @notice CalledToken.transferAndCall 的回调，用 transferAndCall 直接购买 NFT。
+    /// @dev 只有方案 A（CalledToken）需要这个函数；
+    ///      方案 B（纯 ERC20）没有回调，买家只能先 approve 再调用 buyNFT。
     /// @param from   代币转出方，也就是买家。
     /// @param amount 转入本合约的 TOKEN 数量，必须与上架价格一致。
     /// @param data   abi.encode(tokenId)，用来指定要购买的 NFT。
