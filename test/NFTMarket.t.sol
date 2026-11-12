@@ -108,6 +108,32 @@ contract NFTMarketTest is Test {
     }
 
     // ---------------------------------------------------------------
+    // onERC721Received
+    // ---------------------------------------------------------------
+
+    function test_DirectSafeTransferToMarketReverts() public {
+        // 没有先 list()，直接把 NFT safeTransfer 到市场会被拒绝，避免卡死
+        vm.prank(seller);
+        vm.expectRevert(NFTMarket.UnsolicitedNFT.selector);
+        nft.safeTransferFrom(seller, address(market), TOKEN_ID);
+
+        assertEq(nft.ownerOf(TOKEN_ID), seller);
+    }
+
+    function test_OnERC721ReceivedRevertsForNonNFTCaller() public {
+        vm.prank(outsider);
+        vm.expectRevert(NFTMarket.NotNFT.selector);
+        market.onERC721Received(outsider, seller, TOKEN_ID, "");
+    }
+
+    function test_OnERC721ReceivedRevertsForUnsolicitedTransfer() public {
+        // 冒充 NFT 合约调用，但 operator 不是市场
+        vm.prank(address(nft));
+        vm.expectRevert(NFTMarket.UnsolicitedNFT.selector);
+        market.onERC721Received(outsider, seller, TOKEN_ID, "");
+    }
+
+    // ---------------------------------------------------------------
     // buyNFT（approve + transferFrom）
     // ---------------------------------------------------------------
 

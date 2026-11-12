@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {CalledToken, ITokensReceiver} from "./CalledToken.sol";
 
 // ===========================================================================
@@ -41,7 +42,7 @@ import {CalledToken, ITokensReceiver} from "./CalledToken.sol";
 ///            Token 合约会在转账后回调本合约的 onTokensReceived 完成购买，无需 approve。
 ///
 ///         卖家也可以调用 delist(tokenId) 下架并取回 NFT。
-contract NFTMarket is ITokensReceiver {
+contract NFTMarket is ITokensReceiver, IERC721Receiver {
     // 方案 B（纯 ERC20）的声明：
     // using SafeERC20 for IERC20;
     // IERC20 public immutable token;
@@ -80,6 +81,8 @@ contract NFTMarket is ITokensReceiver {
     error CannotBuyOwnNFT();
     error NotToken();
     error InvalidData();
+    error NotNFT();
+    error UnsolicitedNFT();
 
     constructor(CalledToken _token, IERC721 _nft) {
         if (address(_token) == address(0) || address(_nft) == address(0)) {
@@ -115,8 +118,9 @@ contract NFTMarket is ITokensReceiver {
 
         listings[tokenId] = Listing({seller: msg.sender, price: price});
 
-        // 托管 NFT：先完成状态更新，再把 NFT 转入合约。
-        nft.transferFrom(msg.sender, address(this), tokenId);
+        // 托管 NFT：先完成状态更新，再用 safeTransferFrom 转入合约。
+        // safeTransferFrom 会回调本合约的 onERC721Received，用于确认市场能接收 NFT。
+        nft.safeTransferFrom(msg.sender, address(this), tokenId);
 
         emit Listed(tokenId, msg.sender, price);
     }
@@ -184,6 +188,26 @@ contract NFTMarket is ITokensReceiver {
         emit Bought(tokenId, from, listing.seller, amount);
 
         return ITokensReceiver.onTokensReceived.selector;
+    }
+
+    /// @notice NFT safeTransferFrom 到本合约时的回调。
+    /// @dev 只接受 list() 过程中、由本市场自己发起的托管转账：
+    ///      - msg.sender 必须是绑定的 NFT 合约；
+    ///      - operator 必须是本市场（说明是 list() 里调用的 safeTransferFrom）；
+    ///      - tokenId 的上架记录必须已经属于 from（list() 先写记录、再转移 NFT）。
+    ///      其他人直接把 NFT safeTransferFrom 到本合约会被拒绝，避免 NFT 卡死在市场里。
+    function onERC721Received(
+        address operator,
+        address from,
+        uint256 tokenId,
+        bytes calldata /* data */
+    ) external override returns (bytes4) {
+        if (msg.sender != address(nft)) revert NotNFT();
+        if (operator != address(this) || listings[tokenId].seller != from) {
+            revert UnsolicitedNFT();
+        }
+
+        return IERC721Receiver.onERC721Received.selector;
     }
 
     /// @notice 下架自己上架的 NFT，并取回托管的 NFT。
