@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 /// @title Bank
 /// @notice 记录每个地址的累计存款金额，并维护存款金额前 3 名。
 ///         只有管理员可以提取合约中的全部 ETH。
+// 这个是管理eth的bank合约
 contract Bank {
     struct TopDepositor {
         address account;
