@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ITokensReceiver} from "./CalledToken.sol";
 
@@ -14,6 +15,8 @@ import {ITokensReceiver} from "./CalledToken.sol";
 ///         如果使用的是 CalledToken，还可以直接
 ///         CalledToken.transferAndCall(address(tokenBank), amount, "")，
 ///         由 onTokensReceived 回调完成记账。
+///         如果 Token 支持 EIP-2612（如 MyPermitToken），owner 可以离线签名，
+///         由任意地址调用 permitDeposit 一次完成“授权 + 存入”。
 contract TokenBank {
     using SafeERC20 for IERC20;
 
@@ -54,6 +57,42 @@ contract TokenBank {
         token.safeTransferFrom(msg.sender, address(this), amount);
 
         _deposit(msg.sender, amount);
+    }
+
+    /// @notice 使用 EIP-2612 离线签名完成授权并存款：
+    ///         1. 校验 owner 对 Permit 的签名，把 owner 对本合约的额度设为 amount；
+    ///         2. 用该额度把 amount 数量的 Token 从 owner 转入本合约；
+    ///         3. 把 amount 记到 owner 名下（计入 `deposits` 与 `totalDeposits`）。
+    /// @dev 交易发送者（msg.sender）不必是 owner，可以是任意代付人/中继者；
+    ///      owner 只需要离线签名，不需要持有 ETH。
+    ///      Permit 的 spender 必须是本合约地址，nonce 取 owner 当前 nonce，deadline 之后签名失效。
+    ///
+    ///      按 EIP-2612 的安全建议，permit 用 try/catch 包裹：
+    ///      若签名被他人抢跑（对方先调用 permit 消耗掉 nonce），本笔 permit 会失败，
+    ///      但此时额度已经被抢跑者按同一签名设好，继续 transferFrom 即可，不必回滚整笔交易。
+    ///      若 permit 因签名无效/过期失败，且 owner 之前没有给本合约留额度，
+    ///      后面的 transferFrom 会因额度不足回滚。
+    /// @param owner 代币持有人，也是离线签名者。
+    /// @param amount 授权并存入的数量。
+    /// @param deadline 签名截止时间戳（秒）。
+    /// @param v ECDSA 签名参数。
+    /// @param r ECDSA 签名参数。
+    /// @param s ECDSA 签名参数。
+    function permitDeposit(
+        address owner,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        if (amount == 0) revert ZeroAmount();
+
+        try IERC20Permit(address(token)).permit(owner, address(this), amount, deadline, v, r, s) {} catch {}
+
+        token.safeTransferFrom(owner, address(this), amount);
+
+        _deposit(owner, amount);
     }
 
     /// @notice 提取调用者之前存入的 amount 数量的 Token。
@@ -98,7 +137,7 @@ contract TokenBank {
         return ITokensReceiver.onTokensReceived.selector;
     }
 
-    /// @dev 更新某个用户的存款账本，deposit 和 onTokensReceived 共用。
+    /// @dev 更新某个用户的存款账本，deposit、permitDeposit 和 onTokensReceived 共用。
     function _deposit(address user, uint256 amount) private {
         uint256 newDeposit = deposits[user] + amount;
         deposits[user] = newDeposit;
