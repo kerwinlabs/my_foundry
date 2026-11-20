@@ -5,6 +5,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ITokensReceiver} from "./CalledToken.sol";
+import {ISignatureTransfer} from "./interfaces/ISignatureTransfer.sol";
 
 /// @title TokenBank
 /// @notice 记录每个用户存入的 Token 数量，用户可以提取自己之前存入的 Token。
@@ -17,8 +18,15 @@ import {ITokensReceiver} from "./CalledToken.sol";
 ///         由 onTokensReceived 回调完成记账。
 ///         如果 Token 支持 EIP-2612（如 MyPermitToken），owner 可以离线签名，
 ///         由任意地址调用 permitDeposit 一次完成“授权 + 存入”。
+///         如果 Token 不支持 EIP-2612，也可以借助 Uniswap Permit2：
+///         owner 先对 Permit2 合约 approve 一次，之后每笔存款只需离线签名，
+///         由任意地址调用 depositWithPermit2 走 Permit2 的 SignatureTransfer 完成转账。
 contract TokenBank {
     using SafeERC20 for IERC20;
+
+    /// @notice Uniswap Permit2 的规范地址（CREATE2 部署，所有主流链与 Sepolia 相同）。
+    ///         官方文档：https://docs.uniswap.org/contracts/permit2/overview
+    address public constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     /// @notice 存入/提取所使用的 ERC20 代币。
     /// @dev 使用 IERC20 + SafeERC20，兼容 USDT 这类 transfer/transferFrom 不返回 bool 的代币。
@@ -36,6 +44,7 @@ contract TokenBank {
     error ZeroAmount();
     error InsufficientDeposit(uint256 deposit, uint256 needed);
     error NotToken();
+    error IncorrectToken(address token);
 
     constructor(IERC20 _token) {
         token = _token;
@@ -87,6 +96,12 @@ contract TokenBank {
         bytes32 s
     ) external {
         if (amount == 0) revert ZeroAmount();
+
+        // permit 1. 先完成了签名的验证，一定是owner签名的
+        // permit 2. 签名验证通过 进行了真正的approve，授权bank可以支配自己amount额度的token
+        // 其实签名验证通过后，approve给谁支配owner的token，都可以。
+        // 所以就有了permit2，统一的接口。进行签名验证，代替多种token的bank收款。
+
         // permmit的amount，跟下面真实transfer的amount是一致的，如果不一致会怎么样？
         // permit的底层 其实也是调了一次approve的，完成的授权，因此下面的amount虽然可以改变值，但是不能超过amount
         try IERC20Permit(address(token)).permit(owner, address(this), amount, deadline, v, r, s) {} catch {}
@@ -94,6 +109,46 @@ contract TokenBank {
         token.safeTransferFrom(owner, address(this), amount);
 
         _deposit(owner, amount);
+    }
+
+    /// @notice 使用 Uniswap Permit2 的 SignatureTransfer 完成离线签名存款：
+    ///         owner 离线签名 PermitTransferFrom，任意地址把签名提交给本函数，
+    ///         由 Permit2 校验签名并把 owner 的代币直接转到本合约，随后记到 owner 名下。
+    /// @dev 使用前提：owner 已经对 **Permit2 合约** approve 过该代币（只需一次），
+    ///      之后每笔存款只需要一个新的 nonce + 签名，不用再发 approve 交易。
+    ///      Permit2 的签名 nonce 是 unordered nonce bitmap，
+    ///      同一个 (owner, nonce) 只能使用一次，防止签名重放。
+    ///      签名中的 spender 字段是调用 permitTransferFrom 的 msg.sender，
+    ///      也就是本合约地址，而不是 msg.sender（提交交易的人）——因此允许代付人中继。
+    /// @param permit 用户签名的 PermitTransferFrom 结构体（链上不含 spender）。
+    /// @param owner 代币持有人，也是离线签名者。
+    /// @param signature owner 对 Permit2 EIP-712 结构的签名（65 字节 r,s,v）。
+    function depositWithPermit2(
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        address owner,
+        bytes calldata signature
+    ) external {
+        if (permit.permitted.amount == 0) revert ZeroAmount();
+        if (permit.permitted.token != address(token)) {
+            revert IncorrectToken(permit.permitted.token);
+        }
+
+        // 调用 Permit2 的 SignatureTransfer：
+        // 1. 校验 owner 的签名（spender 会被自动拼成 msg.sender = 本合约）；
+        // 2. 消耗 owner 的 unordered nonce；
+        // 3. Permit2 以自身身份执行 token.transferFrom(owner, to, requestedAmount)，
+        //    所以 owner 需要对 Permit2 合约（而不是本合约）有额度。
+        ISignatureTransfer(PERMIT2).permitTransferFrom(
+            permit,
+            ISignatureTransfer.SignatureTransferDetails({
+                to: address(this),
+                requestedAmount: permit.permitted.amount
+            }),
+            owner,
+            signature
+        );
+
+        _deposit(owner, permit.permitted.amount);
     }
 
     /// @notice 提取调用者之前存入的 amount 数量的 Token。
