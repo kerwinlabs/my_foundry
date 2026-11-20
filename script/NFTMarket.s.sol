@@ -28,9 +28,23 @@ contract NFTMarketScript is BaseScript {
         nft = new MyERC721();
         console.log("MyERC721 deployed on %s", address(nft));
 
-        // 3. 部署市场，绑定上面的代币和 NFT（构造函数会拒绝零地址）
-        market = new NFTMarket(token, nft);
+        // 3. 部署市场，绑定上面的代币和 NFT（构造函数会拒绝零地址）。
+        //    admin 默认是部署者，可用环境变量 ADMIN_ADDRESS 覆盖（例如后台签名服务地址）。
+        address admin = vm.envOr("ADMIN_ADDRESS", deployer);
+        market = new NFTMarket(token, nft, admin);
         console.log("NFTMarket deployed on %s", address(market));
+        console.log("permitBuy admin   : %s", admin);
+
+        // permitBuy 的 EIP-712 签名信息，方便在后台用 viem/ethers 构造签名：
+        console.log("");
+        console.log("=== permitBuy EIP-712 domain ===");
+        console.log("name              : NFTMarket");
+        console.log("version           : 1");
+        console.log("chainId           : %s", block.chainid);
+        console.log("verifyingContract : %s", address(market));
+        console.log("PermitBuy(address buyer,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)");
+        console.log("nonce: market.permitNonces(buyer), deadline: unix timestamp");
+        console.log("");
 
         // 保存合约地址到本地
         saveContract("CalledToken", address(token));

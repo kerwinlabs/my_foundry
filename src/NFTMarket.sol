@@ -3,6 +3,8 @@ pragma solidity ^0.8.24;
 
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {CalledToken, ITokensReceiver} from "./CalledToken.sol";
 
 // ===========================================================================
@@ -34,15 +36,20 @@ import {CalledToken, ITokensReceiver} from "./CalledToken.sol";
 ///         1. NFT 持有者先调用 NFT.approve(address(market), tokenId) 授权；
 ///         2. 调用 list(tokenId, price) 上架，NFT 会转入本合约托管。
 ///
-///         购买流程（二选一）：
+///         购买流程（三选一）：
 ///         1. approve + buyNFT（纯 ERC20 也同样支持）：
 ///            买家先调用 Token.approve(address(market), price)，再调用 buyNFT(tokenId, amount)；
 ///         2. transferAndCall 直接购买（CalledToken 专属）：
 ///            买家调用 Token.transferAndCall(address(market), price, abi.encode(tokenId))，
 ///            Token 合约会在转账后回调本合约的 onTokensReceived 完成购买，无需 approve。
+///         3. permitBuy 白名单购买（EIP-712 离线签名）：
+///            管理员在后台离线签发 PermitBuy 消息（见 PERMIT_BUY_TYPEHASH），
+///            白名单买家把 (v, r, s) 交给 permitBuy(tokenId, amount, deadline, v, r, s)，
+///            合约用 EIP-712 验签，签名者必须是 admin 且 nonce/deadline 有效，
+///            验签通过才会执行购买，否则整笔交易 revert。
 ///
 ///         卖家也可以调用 delist(tokenId) 下架并取回 NFT。
-contract NFTMarket is ITokensReceiver, IERC721Receiver {
+contract NFTMarket is ITokensReceiver, IERC721Receiver, EIP712 {
     // 方案 B（纯 ERC20）的声明：
     // using SafeERC20 for IERC20;
     // IERC20 public immutable token;
@@ -52,6 +59,17 @@ contract NFTMarket is ITokensReceiver, IERC721Receiver {
 
     /// @notice 交易的 NFT（MyERC721）。
     IERC721 public immutable nft;
+
+    /// @notice 管理员地址，负责在后台离线签发 permitBuy 的白名单签名。
+    address public immutable admin;
+
+    /// @notice permitBuy 的 EIP-712 结构体类型哈希。
+    ///         PermitBuy(address buyer,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)
+    bytes32 public constant PERMIT_BUY_TYPEHASH =
+        keccak256("PermitBuy(address buyer,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)");
+
+    /// @notice 买家 => 已使用的 permit 次数（签名 nonce），成功调用 permitBuy 后 +1，防止签名重放。
+    mapping(address => uint256) public permitNonces;
 
     /// @notice 上架信息。
     struct Listing {
@@ -83,13 +101,22 @@ contract NFTMarket is ITokensReceiver, IERC721Receiver {
     error InvalidData();
     error NotNFT();
     error UnsolicitedNFT();
+    error PermitExpired(uint256 deadline);
+    error InvalidPermitSigner(address signer);
 
-    constructor(CalledToken _token, IERC721 _nft) {
-        if (address(_token) == address(0) || address(_nft) == address(0)) {
+    /// @param _token 支付代币（CalledToken）。
+    /// @param _nft 被交易的 NFT（MyERC721）。
+    /// @param _admin permitBuy 白名单签名的管理员地址。
+    /// @dev EIP-712 domain：{ name: "NFTMarket", version: "1", chainId, verifyingContract: address(this) }。
+    constructor(CalledToken _token, IERC721 _nft, address _admin)
+        EIP712("NFTMarket", "1")
+    {
+        if (address(_token) == address(0) || address(_nft) == address(0) || _admin == address(0)) {
             revert ZeroAddress();
         }
         token = _token;
         nft = _nft;
+        admin = _admin;
     }
 
     // 方案 B（纯 ERC20）的构造函数：
@@ -129,9 +156,63 @@ contract NFTMarket is ITokensReceiver, IERC721Receiver {
     /// @param tokenId 要购买的 NFT ID。
     /// @param amount  支付的 TOKEN 数量，必须与上架价格一致。
     function buyNFT(uint256 tokenId, uint256 amount) public {
+        _buy(msg.sender, tokenId, amount);
+    }
+
+    /// @notice 白名单购买：校验管理员离线签发的 EIP-712 PermitBuy 签名后完成购买。
+    /// @dev 管理员在后台用 admin 私钥签名，消息结构为：
+    ///      PermitBuy(address buyer, uint256 tokenId, uint256 amount, uint256 nonce, uint256 deadline)
+    ///      其中 buyer 必须等于 msg.sender，nonce 取 `permitNonces(buyer)`，deadline 之后签名失效。
+    ///      签名通过后 nonce +1，同一份签名无法重复使用；
+    ///      因为 chainId 与 verifyingContract 都在 EIP-712 domain 里，
+    ///      签名也不能拿到其他链 / 其他市场合约上重放。
+    ///      买家仍需先调用 Token.approve(address(market), amount) 支付代币。
+    /// @param tokenId 要购买的 NFT ID。
+    /// @param amount  支付的 TOKEN 数量，必须与上架价格一致，也必须与签名中的 amount 一致。
+    /// @param deadline 签名截止时间戳（秒）。
+    /// @param v ECDSA 签名参数。
+    /// @param r ECDSA 签名参数。
+    /// @param s ECDSA 签名参数。
+    function permitBuy(
+        uint256 tokenId,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        if (block.timestamp > deadline) revert PermitExpired(deadline);
+
+        address buyer = msg.sender;
+        uint256 nonce = permitNonces[buyer];
+
+        // 按 EIP-712 编码整个 PermitBuy 结构体，再拼上 domain separator：
+        // hashTypedDataV4 = keccak256("\x19\x01" || DOMAIN_SEPARATOR || structHash)
+        bytes32 structHash = keccak256(
+            abi.encode(PERMIT_BUY_TYPEHASH, buyer, tokenId, amount, nonce, deadline)
+        );
+        address signer = ECDSA.recover(_hashTypedDataV4(structHash), v, r, s);
+
+        // 只有管理员签名的地址才算白名单用户，否则整笔交易回滚。
+        if (signer != admin) revert InvalidPermitSigner(signer);
+
+        // checks-effects-interactions：先消耗 nonce，再进入购买流程，防止重放。
+        permitNonces[buyer] = nonce + 1;
+
+        _buy(buyer, tokenId, amount);
+    }
+
+    /// @notice 返回 EIP-712 domain separator，方便前端/测试构造签名。
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
+    /// @dev buyNFT 与 permitBuy 共用的购买逻辑。
+    function _buy(address buyer, uint256 tokenId, uint256 amount) private {
         Listing memory listing = listings[tokenId];
         if (listing.seller == address(0)) revert NotListed(tokenId);
-        if (msg.sender == listing.seller) revert CannotBuyOwnNFT();
+        if (buyer == listing.seller) revert CannotBuyOwnNFT();
         if (amount != listing.price) {
             revert PriceMismatch(listing.price, amount);
         }
@@ -141,14 +222,14 @@ contract NFTMarket is ITokensReceiver, IERC721Receiver {
 
         // TOKEN 由买家直接转给卖家，本合约不托管 ERC20。
         // 方案 A（CalledToken）：CalledToken 本身就是标准 ERC20，直接 transferFrom 即可。
-        token.transferFrom(msg.sender, listing.seller, amount);
+        token.transferFrom(buyer, listing.seller, amount);
         // 方案 B（纯 ERC20）：如果换成 USDT 这类非标准代币，改用 SafeERC20：
-        // token.safeTransferFrom(msg.sender, listing.seller, amount);
+        // token.safeTransferFrom(buyer, listing.seller, amount);
 
         // 把托管的 NFT 转给买家。
-        nft.safeTransferFrom(address(this), msg.sender, tokenId);
+        nft.safeTransferFrom(address(this), buyer, tokenId);
 
-        emit Bought(tokenId, msg.sender, listing.seller, amount);
+        emit Bought(tokenId, buyer, listing.seller, amount);
     }
 
     /// @notice CalledToken.transferAndCall 的回调，用 transferAndCall 直接购买 NFT。

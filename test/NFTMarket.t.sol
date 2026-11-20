@@ -18,6 +18,10 @@ contract NFTMarketTest is Test {
     address public buyer = makeAddr("buyer");
     address public outsider = makeAddr("outsider");
 
+    /// @notice permitBuy 管理员私钥及其地址（管理员在后台用该私钥离线签名）。
+    uint256 internal constant ADMIN_PK = 0xA11CE;
+    address public admin = vm.addr(ADMIN_PK);
+
     uint256 internal constant TOKEN_ID = 1;
     uint256 internal constant PRICE = 100e18;
     uint256 internal constant USER_BALANCE = 1_000e18;
@@ -26,7 +30,7 @@ contract NFTMarketTest is Test {
     function setUp() public {
         token = new CalledToken("Called Token", "CALL", 1_000_000e18);
         nft = new MyERC721();
-        market = new NFTMarket(token, nft);
+        market = new NFTMarket(token, nft, admin);
 
         // 给买卖双方发测试用的 TOKEN
         token.transfer(seller, USER_BALANCE);
@@ -52,6 +56,26 @@ contract NFTMarketTest is Test {
         (address listedSeller, uint256 listedPrice) = market.listings(TOKEN_ID);
         assertEq(listedSeller, address(0), "listing seller should be cleared");
         assertEq(listedPrice, 0, "listing price should be cleared");
+    }
+
+    /// @dev 模拟管理员在后台离线签名 PermitBuy。
+    ///      digest = keccak256("\x19\x01" || DOMAIN_SEPARATOR || structHash)。
+    function _signPermit(
+        uint256 signerPk,
+        address permitBuyer,
+        uint256 tokenId,
+        uint256 amount,
+        uint256 deadline
+    ) internal view returns (uint8 v, bytes32 r, bytes32 s) {
+        uint256 nonce = market.permitNonces(permitBuyer);
+        // 结构化hash的 nonce deadline 与 permitBuy 的参数要一致
+        bytes32 structHash = keccak256(
+            abi.encode(market.PERMIT_BUY_TYPEHASH(), permitBuyer, tokenId, amount, nonce, deadline)
+        );
+        bytes32 digest = keccak256(
+            abi.encodePacked("\x19\x01", market.DOMAIN_SEPARATOR(), structHash)
+        );
+        return vm.sign(signerPk, digest);
     }
 
     // ---------------------------------------------------------------
@@ -209,6 +233,87 @@ contract NFTMarketTest is Test {
     }
 
     // ---------------------------------------------------------------
+    // permitBuy（EIP-712 管理员签名白名单）
+    // ---------------------------------------------------------------
+
+    function test_PermitBuySucceedsWithAdminSignature() public {
+        _list();
+        uint256 deadline = block.timestamp + 1 days;
+        // 签名的参数 deadline 要跟 permit的deadline一致
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signPermit(ADMIN_PK, buyer, TOKEN_ID, PRICE, deadline);
+
+        uint256 sellerBefore = token.balanceOf(seller);
+        uint256 buyerBefore = token.balanceOf(buyer);
+
+        vm.startPrank(buyer);
+        token.approve(address(market), PRICE);
+        market.permitBuy(TOKEN_ID, PRICE, deadline, v, r, s);
+        vm.stopPrank();
+
+        assertEq(nft.ownerOf(TOKEN_ID), buyer);
+        assertEq(token.balanceOf(seller), sellerBefore + PRICE);
+        assertEq(token.balanceOf(buyer), buyerBefore - PRICE);
+        assertEq(market.permitNonces(buyer), 1, "nonce should be consumed");
+        _assertListingCleared();
+    }
+
+    function test_PermitBuyRevertsWhenSignedByNonAdmin() public {
+        _list();
+        uint256 otherPk = 0xB0B;
+        uint256 deadline = block.timestamp + 1 days;
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signPermit(otherPk, buyer, TOKEN_ID, PRICE, deadline);
+
+        vm.prank(buyer);
+        vm.expectRevert(
+            abi.encodeWithSelector(NFTMarket.InvalidPermitSigner.selector, vm.addr(otherPk))
+        );
+        market.permitBuy(TOKEN_ID, PRICE, deadline, v, r, s);
+    }
+
+    function test_PermitBuyRevertsWhenExpired() public {
+        _list();
+        uint256 deadline = block.timestamp - 1;
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signPermit(ADMIN_PK, buyer, TOKEN_ID, PRICE, deadline);
+
+        vm.prank(buyer);
+        vm.expectRevert(
+            abi.encodeWithSelector(NFTMarket.PermitExpired.selector, deadline)
+        );
+        market.permitBuy(TOKEN_ID, PRICE, deadline, v, r, s);
+    }
+
+    function test_PermitBuyRevertsWhenCallerIsNotSignedBuyer() public {
+        _list();
+        uint256 deadline = block.timestamp + 1 days;
+        // 管理员签名给 buyer，但 outsider 拿来用：msg.sender 与签名中的 buyer 不一致
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signPermit(ADMIN_PK, buyer, TOKEN_ID, PRICE, deadline);
+
+        vm.prank(outsider);
+        vm.expectRevert();
+        market.permitBuy(TOKEN_ID, PRICE, deadline, v, r, s);
+    }
+
+    function test_PermitBuySignatureCannotBeReplayed() public {
+        _list();
+        uint256 deadline = block.timestamp + 1 days;
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signPermit(ADMIN_PK, buyer, TOKEN_ID, PRICE, deadline);
+
+        vm.startPrank(buyer);
+        token.approve(address(market), PRICE);
+        market.permitBuy(TOKEN_ID, PRICE, deadline, v, r, s);
+
+        // nonce 已从 0 变成 1，旧签名（nonce = 0）验签失败
+        vm.expectRevert();
+        market.permitBuy(TOKEN_ID, PRICE, deadline, v, r, s);
+        vm.stopPrank();
+    }
+
+    // ---------------------------------------------------------------
     // transferAndCall 回调购买
     // ---------------------------------------------------------------
 
@@ -354,9 +459,12 @@ contract NFTMarketTest is Test {
 
     function test_ConstructorRejectsZeroAddresses() public {
         vm.expectRevert(NFTMarket.ZeroAddress.selector);
-        new NFTMarket(CalledToken(address(0)), nft);
+        new NFTMarket(CalledToken(address(0)), nft, admin);
 
         vm.expectRevert(NFTMarket.ZeroAddress.selector);
-        new NFTMarket(token, IERC721(address(0)));
+        new NFTMarket(token, IERC721(address(0)), admin);
+
+        vm.expectRevert(NFTMarket.ZeroAddress.selector);
+        new NFTMarket(token, nft, address(0));
     }
 }

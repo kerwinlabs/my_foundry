@@ -87,7 +87,8 @@ contract TokenBank {
         bytes32 s
     ) external {
         if (amount == 0) revert ZeroAmount();
-
+        // permmit的amount，跟下面真实transfer的amount是一致的，如果不一致会怎么样？
+        // permit的底层 其实也是调了一次approve的，完成的授权，因此下面的amount虽然可以改变值，但是不能超过amount
         try IERC20Permit(address(token)).permit(owner, address(this), amount, deadline, v, r, s) {} catch {}
 
         token.safeTransferFrom(owner, address(this), amount);
