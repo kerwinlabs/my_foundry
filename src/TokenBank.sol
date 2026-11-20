@@ -193,7 +193,7 @@ contract TokenBank {
         return ITokensReceiver.onTokensReceived.selector;
     }
 
-    /// @dev 更新某个用户的存款账本，deposit、permitDeposit 和 onTokensReceived 共用。
+    /// @dev 更新某个用户的存款账本，deposit、permitDeposit、depositWithPermit2 和 onTokensReceived 共用。
     function _deposit(address user, uint256 amount) private {
         uint256 newDeposit = deposits[user] + amount;
         deposits[user] = newDeposit;
