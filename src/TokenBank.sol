@@ -21,6 +21,11 @@ import {ISignatureTransfer} from "./interfaces/ISignatureTransfer.sol";
 ///         如果 Token 不支持 EIP-2612，也可以借助 Uniswap Permit2：
 ///         owner 先对 Permit2 合约 approve 一次，之后每笔存款只需离线签名，
 ///         由任意地址调用 depositWithPermit2 走 Permit2 的 SignatureTransfer 完成转账。
+///
+///         另外维护一个按存款金额从高到低排序的前 10 名榜单；
+///         实现参考 SchoolOptimized：用哨兵 GUARD 作为头指针、
+///         `mapping(address => address)` 保存 next 指针的单向循环链表。
+///         每次存款/取款后都会调整该用户的名次，榜单满 10 人时新的大额存款会挤掉最后一名。
 contract TokenBank {
     using SafeERC20 for IERC20;
 
@@ -38,6 +43,22 @@ contract TokenBank {
     /// @notice 所有用户存入的 Token 总量。
     uint256 public totalDeposits;
 
+    /// @notice 排行榜最多保存的用户数。
+    uint256 public constant TOP_N = 10;
+
+    /// @dev 头指针哨兵，参考 SchoolOptimized：榜单头 = `_next[GUARD]`；
+    ///      空表时 `_next[GUARD] == GUARD`，最后一个节点的 next 也指回 GUARD，
+    ///      因此遍历时只需判断 `cursor == GUARD`，不用处理 address(0)。
+    address private constant GUARD = address(1);
+
+    /// @dev 按存款金额从高到低排列的单向循环链表：user => 下一个金额更少的用户。
+    ///      节点金额不单独保存，统一读 `deposits[user]`，避免两份数据不一致。
+    ///      `_next[user] == address(0)` 表示该用户不在榜单中。
+    mapping(address => address) private _next;
+
+    /// @notice 当前榜单人数，最多 TOP_N。
+    uint256 public topCount;
+
     event Deposited(address indexed user, uint256 amount, uint256 userDeposit);
     event Withdrawn(address indexed user, uint256 amount, uint256 userDeposit);
 
@@ -48,6 +69,8 @@ contract TokenBank {
 
     constructor(IERC20 _token) {
         token = _token;
+        // 初始化空链表：头哨兵指向自己。
+        _next[GUARD] = GUARD;
     }
 
     /// @dev 只允许绑定的 token 合约调用回调，避免别人伪造存款。
@@ -162,6 +185,9 @@ contract TokenBank {
         deposits[msg.sender] = userDeposit - amount;
         totalDeposits -= amount;
 
+        // 存款减少后重新计算名次（金额降为 0 时会从榜单移除）。
+        _updateTopList(msg.sender);
+
         token.safeTransfer(msg.sender, amount);
 
         emit Withdrawn(msg.sender, amount, userDeposit - amount);
@@ -170,6 +196,33 @@ contract TokenBank {
     /// @notice 查询某个用户当前存入的 Token 数量。
     function getDeposit(address user) external view returns (uint256) {
         return deposits[user];
+    }
+
+    /// @notice 当前榜首地址，榜单为空时返回 address(0)。
+    function topHead() external view returns (address) {
+        address head = _next[GUARD];
+        return head == GUARD ? address(0) : head;
+    }
+
+    /// @notice 当前榜尾地址，榜单为空时返回 address(0)。
+    function topTail() external view returns (address) {
+        address tail = _tail();
+        return tail == GUARD ? address(0) : tail;
+    }
+
+    /// @notice 返回按存款金额从高到低排列的前 10 名榜单。
+    /// @dev 从 `_next[GUARD]` 沿 next 指针遍历，最多迭代 TOP_N 个节点。
+    function getTopDepositors() external view returns (address[] memory users, uint256[] memory amounts) {
+        uint256 count = topCount;
+        users = new address[](count);
+        amounts = new uint256[](count);
+
+        address cursor = _next[GUARD];
+        for (uint256 i = 0; i < count; ++i) {
+            users[i] = cursor;
+            amounts[i] = deposits[cursor];
+            cursor = _next[cursor];
+        }
     }
 
     /// @notice CalledToken.transferAndCall 的转账回调：
@@ -199,6 +252,78 @@ contract TokenBank {
         deposits[user] = newDeposit;
         totalDeposits += amount;
 
+        // 存款增加后重新计算名次（可能上榜或向前移动）。
+        _updateTopList(user);
+
         emit Deposited(user, amount, newDeposit);
+    }
+
+    /// @dev 用户存款变化后，重新计算其在前 10 名链表中的位置。
+    ///      - 已在榜：先摘除，金额不为 0 时再按金额重新插入，相当于自动上移/下移；
+    ///      - 不在榜：榜单未满直接插入；已满则只有金额严格大于最后一名时才挤掉榜尾。
+    /// @dev 注意：榜单只保存前 10 名，被挤掉的用户不会保留在链表中。
+    ///      因此若榜内用户取款后金额下降，无法自动把榜外第 11 名补进来
+    ///      （链表中没有第 11 名及以后用户的数据）；这是"只存前 10"方案的固有限制。
+    function _updateTopList(address user) private {
+        uint256 amount = deposits[user];
+
+        // `_next[user] != address(0)` 表示用户当前在榜单中。
+        if (_next[user] != address(0)) {
+            _removeFromList(user);
+        }
+
+        if (amount == 0) return;
+
+        if (topCount < TOP_N) {
+            _insertSorted(user);
+            return;
+        }
+
+        // 榜单已满：金额严格大于榜尾时才替换最后一名。
+        address tail = _tail();
+        if (amount > deposits[tail]) {
+            _removeFromList(tail);
+            _insertSorted(user);
+        }
+    }
+
+    /// @dev 按金额从高到低把 user 插入单向循环链表（参考 SchoolOptimized 的 addStudent）。
+    ///      金额相同时，新插入的用户排在已有用户之后（稳定排序）。
+    function _insertSorted(address user) private {
+        uint256 amount = deposits[user];
+
+        // 从 GUARD 的下一个节点开始，找到第一个金额小于 amount 的位置插入；
+        // 金额 >= amount 的节点会被跳过，从而保证相同金额时先来者在前。
+        address prev = GUARD;
+        address cursor = _next[GUARD];
+        while (cursor != GUARD && deposits[cursor] >= amount) {
+            prev = cursor;
+            cursor = _next[cursor];
+        }
+
+        _next[user] = cursor;
+        _next[prev] = user;
+        topCount += 1;
+    }
+
+    /// @dev 把在榜用户 user 从单向链表中摘除（参考 SchoolOptimized 的 removeStudent）。
+    ///      单链表需要先从 GUARD 找到 user 的前驱节点。
+    function _removeFromList(address user) private {
+        address prev = GUARD;
+        while (_next[prev] != user) {
+            prev = _next[prev];
+        }
+
+        _next[prev] = _next[user];
+        _next[user] = address(0);
+        topCount -= 1;
+    }
+
+    /// @dev 返回榜尾节点（next 指向 GUARD 的节点）；空表时返回 GUARD。
+    function _tail() private view returns (address tail) {
+        tail = GUARD;
+        while (_next[tail] != GUARD) {
+            tail = _next[tail];
+        }
     }
 }
